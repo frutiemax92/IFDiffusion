@@ -135,14 +135,24 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
     optimizer.step()
     optimizer.zero_grad()
     
-    # generate an image
-    generated_images = generator(fake_images, ratios, embeddings)
+    # only do for one column
+    with torch.no_grad():
+        start_column = torch.randint(0, generator.num_columns - 2, (1,))[0]
+        generated_images = generator(fake_images, ratios, embeddings, stop_column=start_column)
+    generated_images = generator(generated_images, ratios, embeddings, start_column=start_column, stop_column=start_column+1)
+
+    # make sure we don't have complex images
+    generated_images = generated_images.abs()
     disciminator_pred = discriminator(generated_images)
 
-    # these should be identified close to real images!
-    loss_d = discriminator_loss_fn(disciminator_pred, real_preds)
+    # the score of the discriminator should follow a quadratic formula based on the column progress
+    coeff = (start_column+1) / (generator.num_columns - 1)
+    wanted_score = 2 * coeff / (1 + torch.pow(coeff, 2))
+    preds = torch.full((batch_size, discriminator_features), wanted_score).to(device=disciminator_pred.device, dtype=disciminator_pred.dtype)
+
+    loss_d = discriminator_loss_fn(disciminator_pred, preds)
     loss_g = generator_loss_fn(generated_images, original_images)
-    accelerator.backward(loss_d)
+    accelerator.backward(loss_d, retain_graph=True)
     accelerator.backward(loss_g)
     optimizer.step()
     optimizer.zero_grad()
@@ -236,6 +246,9 @@ def train(args):
     extract_t5 = args.extract_t5
     discriminator = Discriminator(image_size, discriminator_features)
     generator = Generator(image_size, generator_num_rows, generator_num_heads, generator_embed_dim, generator_ratio_mult)
+    
+    # we use the internal tile_generator as we only want to train one step at a time
+    tile_generator = generator.tile_generator
 
     # setup the optimizers
     optimizer = AdamW(params=generator.parameters(), lr=lr)

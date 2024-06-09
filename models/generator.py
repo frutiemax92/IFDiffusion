@@ -31,7 +31,7 @@ class Transformer(nn.Module):
     def forward(self, x, embeddings):
         # do some calculations with the embeddings
         query = torch.flatten(x, start_dim=1)
-        key = embeddings
+        key = embeddings.to(device=query.device, dtype=query.dtype)
         attn_output, attn_output_weights = self.cross_attn(query, key, query)
 
         # add input_freq and attention output
@@ -110,11 +110,11 @@ class Generator(nn.Module):
     def __init__(self, image_size, num_rows, num_heads, embed_dim, ratio_multiplier):
         super().__init__()
         self.tile_generator = TileGenerator(image_size, num_rows, num_heads, embed_dim, ratio_multiplier)
-        self.num_rows = num_rows
+        self.num_columns = num_rows
         self.ratio_multiplier = ratio_multiplier
         self.image_size = image_size
 
-    def forward(self, images, ratios, prompt_embeds):
+    def forward(self, images, ratios, prompt_embeds, start_column = 0, stop_column=-1):
         device = images.device
         dtype = images.dtype
 
@@ -132,8 +132,11 @@ class Generator(nn.Module):
         ratios_mult = ratios * self.ratio_multiplier
         ratios_mult = ratios.to(torch.int)
 
-        for row in range(self.num_rows):
-            z_images = self.tile_generator(z_images, ratios_mult, prompt_embeds, row)
+        if stop_column == -1:
+            stop_column = self.num_columns
+
+        for column in range(start_column, stop_column):
+            z_images = self.tile_generator(z_images, ratios_mult, prompt_embeds, column)
 
         images = torch.fft.ifftn(z_images, (self.image_size, self.image_size), dim=(2, 3))
         return images
