@@ -8,6 +8,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from pathlib import Path
 import sys
+import gc
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
 
@@ -34,8 +35,9 @@ class Bucket:
         return len(self.image_paths)
 
 class BucketSampler(Sampler):
-    def __init__(self, batch_size : int, buckets : list[Bucket]):
+    def __init__(self, batch_size : int, buckets : list[Bucket], embed_dim):
         self.batches = []
+        self.embed_dim = embed_dim
 
         # go through all the buckets and make batches
         for bucket in buckets:
@@ -57,18 +59,19 @@ class BucketSampler(Sampler):
             for elem in batch:
                 image_path, caption_path = elem
                 with Image.open(image_path) as image:
-                    with open(caption_path) as f:
-                        caption = f.read()
-                        image = pil_to_tensor(image)
-                        captions.append(caption)
-                        images.append(image)
+                    caption = torch.load(caption_path, weights_only=True)
+                    image = pil_to_tensor(image)
+                    captions.append(caption[0])
+                    images.append(image)
 
             image_width = images[0].shape[2]
             image_height = images[0].shape[1]
             images_tensor = torch.zeros((len(batch), 3, image_height, image_width))
+            embeddings = torch.zeros((len(captions), self.embed_dim))
             for i in range(len(batch)):
                 images_tensor[i] = images[i]
-            yield (images_tensor, captions)
+                embeddings[i, :captions[i].shape[0]] = captions[i]
+            yield (images_tensor, embeddings)
 
     def __len__(self):
         return len(self.batches)
@@ -95,10 +98,10 @@ class ImageDataset(Dataset):
                     suffix != '.jpeg':
                     continue
                 
-                # check if there is an associated .txt file
+                # check if there is an associated .npz file
                 filename = filepath.stem
-                txt_file = filepath.parent.joinpath(filename + '.txt')
-                if txt_file.exists():
+                npz_file = filepath.parent.joinpath(filename + '.npz')
+                if npz_file.exists():
                     # open the image to find its size
                     with Image.open(filepath) as image:
                         bucket = self.find_bucket(image.width, image.height)
@@ -107,7 +110,7 @@ class ImageDataset(Dataset):
                             bucket = self.buckets[-1]
                         
                         bucket.image_paths.append(filepath)
-                        bucket.caption_paths.append(txt_file)
+                        bucket.caption_paths.append(npz_file)
 
     def __getitem__(self, batch):
         # get the image size
@@ -144,9 +147,31 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
     optimizer.step()
     optimizer.zero_grad()
 
-def eval(generator, tokenizer : T5Tokenizer, encoder : T5ForConditionalGeneration, prompts,
-        generator_embed_dim, width, height, device='cuda'):
+def extract_features(tokenizer : T5Tokenizer, encoder : T5ForConditionalGeneration, dataset_folder, generator_embed_dim, device='cuda'):
+    # we load all .txt images and put them on the disk
+    for (dirpath, dirnames, filenames) in walk(dataset_folder):
+        for filename in tqdm(filenames, desc='Extracting T5 embeddings'):
+            filepath = pathlib.Path(dirpath).joinpath(filename)
+            suffix = pathlib.Path(filepath).suffix
+
+            if suffix != '.txt':
+                continue
+            
+            # check if there is an associated .txt file
+            caption = open(filepath).read()
+            input_ids = tokenizer(caption, return_tensors="pt", padding=True).input_ids.to(device=device)
+            outputs = encoder.generate(input_ids, max_new_tokens=generator_embed_dim // 3).to(torch.float)
+
+            # save to disk
+            stem = pathlib.Path(filepath).stem
+            output = pathlib.Path(dirpath).joinpath(stem + '.npz')
+            torch.save(outputs, output)
+
+
+def eval(generator, prompts, generator_embed_dim, width, height, device='cuda'):
     images = []
+    tokenizer = T5Tokenizer.from_pretrained("google-t5/t5-small")
+    encoder = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small").to(device=device)
 
     with torch.no_grad():
         input_ids = tokenizer(prompts, return_tensors="pt", padding=True).input_ids.to(device=device)
@@ -182,6 +207,11 @@ def eval(generator, tokenizer : T5Tokenizer, encoder : T5ForConditionalGeneratio
             pil_image = to_pil_image(image)
             pil_image.save(f'test{i}.png')
             i = i + 1 
+    
+    del tokenizer
+    del encoder
+    gc.collect()
+    torch.cuda.empty_cache()
             
 def train(args):
     dataset_folder = args.dataset_folder
@@ -192,17 +222,18 @@ def train(args):
     eval_prompts = args.eval_prompts
 
     dataset = ImageDataset(dataset_folder)
-    bucket_sampler = BucketSampler(batch_size, dataset.buckets)
+    generator_embed_dim = args.generator_embed_dim
+    bucket_sampler = BucketSampler(batch_size, dataset.buckets, generator_embed_dim // 3)
 
     # load the models
     image_size = args.image_size
     discriminator_features = args.discriminator_features
     generator_num_rows = args.generator_num_rows
     generator_num_heads = args.generator_num_heads
-    generator_embed_dim = args.generator_embed_dim
     generator_ratio_mult = args.generator_ratio_mult
     eval_image_height = args.eval_image_height
     eval_image_width = args.eval_image_width
+    extract_t5 = args.extract_t5
     discriminator = Discriminator(image_size, discriminator_features)
     generator = Generator(image_size, generator_num_rows, generator_num_heads, generator_embed_dim, generator_ratio_mult)
 
@@ -210,6 +241,16 @@ def train(args):
     optimizer = AdamW(params=generator.parameters(), lr=lr)
     tokenizer = T5Tokenizer.from_pretrained("google-t5/t5-small")
     encoder = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
+    accelerator = Accelerator(mixed_precision='bf16')
+    tokenizer, encoder = accelerator.prepare(tokenizer, encoder)
+
+    # first extract the features
+    if extract_t5:
+        extract_features(tokenizer, encoder, dataset_folder, generator_embed_dim)
+    del encoder
+    del tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
 
     def collate_fn(batch):
         return batch[0]
@@ -219,8 +260,8 @@ def train(args):
     # prepare the models
     accelerator = Accelerator(mixed_precision='bf16')
     
-    dataloader, optimizer, tokenizer, encoder, discriminator, generator = \
-        accelerator.prepare(dataloader, optimizer, tokenizer, encoder, discriminator, generator)
+    dataloader, optimizer, discriminator, generator = \
+        accelerator.prepare(dataloader, optimizer, discriminator, generator)
 
     # loss function for discriminator
     discriminator_loss_fn = torch.nn.BCELoss()
@@ -245,15 +286,8 @@ def train(args):
             original_images = transform(original_images)
             optimizer.zero_grad()
 
-            # generate an image with a caption
-            # generate the embeddings for the caption
-            with torch.no_grad():
-                input_ids = tokenizer(captions, return_tensors="pt", padding=True).input_ids.to(device=original_images.device)
-                outputs = encoder.generate(input_ids, max_new_tokens=generator_embed_dim // 3).to(torch.float)
-
-                # pad the outputs for the embedding dim/3
-                embeddings = torch.zeros((batch_size, generator_embed_dim // 3))
-                embeddings[:, :outputs.shape[1]] = outputs
+            embeddings = torch.zeros((batch_size, generator_embed_dim // 3))
+            embeddings[:, :captions.shape[1]] = captions
 
             train_loop(discriminator, original_images, batch_size, discriminator_features, discriminator_loss_fn, accelerator,
                        optimizer, generator, ratios, embeddings, generator_loss_fn)
@@ -261,7 +295,7 @@ def train(args):
             # check if we need to do evaluations images
             step_count = step_count + 1
             if step_count % steps_per_eval == 0:
-                eval(generator, tokenizer, encoder, eval_prompts, generator_embed_dim, eval_image_width, eval_image_height, original_images.device)
+                eval(generator, eval_prompts, generator_embed_dim, eval_image_width, eval_image_height, original_images.device)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -278,6 +312,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval_image_height', type=int, required=False, default=512)
     parser.add_argument('--eval_image_width', type=int, required=False, default=512)
     parser.add_argument('--steps_per_eval', type=int, required=False, default=100)
+    parser.add_argument('--extract_t5', action=argparse.BooleanOptionalAction)
     parser.add_argument('--eval_prompts', '-l', nargs='+', required=True)
 
     args = parser.parse_args()

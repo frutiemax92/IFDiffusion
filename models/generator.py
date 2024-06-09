@@ -164,7 +164,6 @@ if __name__ == '__main__':
         images = generator(images, ratios, prompt_embeds)
 
     # save the generator to see its size
-    print('saving...')
     state_dict = generator.state_dict()
     new_state_dict = {}
     for key in state_dict.keys():
