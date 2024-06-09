@@ -1,0 +1,4 @@
+datasets>=2.19
+accelerate>=0.31
+transformers>=4.41
+SentencePiece>=0.2
