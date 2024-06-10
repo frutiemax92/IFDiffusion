@@ -154,13 +154,13 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
     with torch.no_grad():
         start_column = torch.randint(0, generator.num_columns - 2, (1,))[0]
         z_fake_images = torch.fft.fftn(fake_images.to(torch.float), dim=(2, 3))
-        z_images = generator(z_fake_images, ratios, embeddings, stop_column=start_column)
-    z_images = generator(z_images, ratios, embeddings, start_column=start_column, stop_column=start_column+1)
+        #z_images = generator(z_fake_images, ratios, embeddings, stop_column=start_column)
+    #z_images = generator(z_images, ratios, embeddings, start_column=start_column, stop_column=start_column+1)
+    z_images = generator(z_fake_images, ratios, embeddings)
 
     # make sure we don't have complex images
     generated_images = torch.fft.ifftn(z_images, (generator.image_size, generator.image_size), dim=(2, 3))
     generated_images = generated_images.real
-    generated_images = generated_images.to(dtype=torch.bfloat16)
     disciminator_pred = discriminator(generated_images)
 
     # the score of the discriminator should follow a quadratic formula based on the column progress
@@ -209,7 +209,7 @@ def extract_features(tokenizer : T5Tokenizer, encoder : T5ForConditionalGenerati
             torch.save(outputs, output)
 
 
-def eval(generator, prompts, generator_embed_dim, width, height, device='cuda'):
+def eval(generator, prompts, generator_embed_dim, model_size, width, height, device='cuda'):
     images = []
     tokenizer = T5Tokenizer.from_pretrained("google-t5/t5-small")
     encoder = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small").to(device=device)
@@ -222,7 +222,8 @@ def eval(generator, prompts, generator_embed_dim, width, height, device='cuda'):
         embeddings = torch.zeros((outputs.shape[0], generator_embed_dim // 3))
         embeddings[:, :outputs.shape[1]] = outputs
 
-        z_images = torch.rand((outputs.shape[0], 3, height, width), dtype=torch.complex32)
+        z_images = torch.rand((outputs.shape[0], 3, model_size, model_size), dtype=torch.complex64)
+        z_images = torch.fft.fftn(z_images.to(torch.float), dim=(2, 3))
         ratios = torch.full((outputs.shape[0],), height / width)
 
         embeddings = embeddings.to(device=device)
@@ -285,7 +286,7 @@ def train(args):
     optimizer = AdamW(params=list(generator.parameters()) + list(discriminator.parameters()), lr=lr)
     tokenizer = T5Tokenizer.from_pretrained("google-t5/t5-small")
     encoder = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
-    accelerator = Accelerator(mixed_precision='bf16')
+    accelerator = Accelerator()
     tokenizer, encoder = accelerator.prepare(tokenizer, encoder)
 
     # first extract the features
@@ -302,7 +303,7 @@ def train(args):
     dataloader = DataLoader(dataset, sampler=bucket_sampler, collate_fn=collate_fn)
 
     # prepare the models
-    accelerator = Accelerator(mixed_precision='bf16')
+    accelerator = Accelerator()
     
     dataloader, optimizer, discriminator, generator = \
         accelerator.prepare(dataloader, optimizer, discriminator, generator)
@@ -318,14 +319,14 @@ def train(args):
     for t in tqdm(range(epochs), desc='Epochs'):
         for batch in dataloader:
             original_images, captions = batch
-            original_images = original_images.to(dtype=torch.bfloat16)
-            captions = captions.to(dtype=torch.bfloat16)
+            #original_images = original_images.to(dtype=torch.bfloat16)
+            #captions = captions.to(dtype=torch.bfloat16)
 
             # calculate the ratios of the images
             image_width = original_images.shape[2]
             image_height = original_images.shape[1]
             batch_size = original_images.shape[0]
-            ratios = torch.full((batch_size,), image_height / image_width, dtype=torch.bfloat16)
+            ratios = torch.full((batch_size,), image_height / image_width)
 
             # rescale the original images down to a square image
             transform = Resize((image_size, image_size))
@@ -341,7 +342,7 @@ def train(args):
             # check if we need to do evaluations images
             step_count = step_count + 1
             if step_count % steps_per_eval == 0:
-                eval(generator, eval_prompts, generator_embed_dim, eval_image_width, eval_image_height, original_images.device)
+                eval(generator, eval_prompts, generator_embed_dim, image_size, eval_image_width, eval_image_height, original_images.device)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

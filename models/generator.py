@@ -22,6 +22,18 @@ class Transformer(nn.Module):
         # self attention
         self.self_attn = nn.MultiheadAttention(embed_dim=3 * column_width * image_height, num_heads=num_heads, batch_first=True)
 
+        # linear layer at the end
+        self.linear = nn.Sequential(
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+        )
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+
+        self.linear.apply(init_weights)
+
         # relu activation layer
         self.relu = nn.ReLU()
 
@@ -44,8 +56,10 @@ class Transformer(nn.Module):
         attn_output, attn_output_weights = self.self_attn(query, query, query)
         x = x + attn_output.reshape(x.shape)
         x = self.layer_norm(x)
-        x = self.tanh(x)
-        return x
+
+        y = torch.flatten(x, start_dim=1)
+        y = self.linear(y)
+        return torch.reshape(y, x.shape)
 
 class TileGenerator(nn.Module):
     def __init__(self, image_size, num_columns, num_heads, embed_dim, ratio_multiplier):
@@ -101,7 +115,7 @@ class TileGenerator(nn.Module):
 
         real = self.real_transformer(real, embeds)
         imag = self.imag_transformer(imag, embeds)
-        z = torch.complex(real, imag)
+        z = torch.complex(real.to(dtype=torch.float), imag.to(dtype=torch.float))
 
         z_image[:, :, :, min_x:max_x] = z_image[:, :, :, min_x:max_x] + z
         return z_image
@@ -120,10 +134,6 @@ class Generator(nn.Module):
 
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         batch_size = ratios.shape[0]
-
-        # first resize the images to square images
-        transform = Resize((self.image_size, self.image_size))
-        z_images = transform(z_images)
 
         # calculate the discrete real fft transform
         #z_images = torch.fft.fftn(images.to(dtype=torch.float32), s=(self.image_size, self.image_size))
@@ -172,5 +182,3 @@ if __name__ == '__main__':
     for key in state_dict.keys():
         new_state_dict[key] = state_dict[key].to(dtype=torch.float16)
     torch.save(new_state_dict, 'test.pth')
-
-
