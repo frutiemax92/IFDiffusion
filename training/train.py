@@ -122,13 +122,25 @@ class ImageDataset(Dataset):
         # get the image size
         return batch
 
+def freeze_model(model):
+    for param in model.parameters():
+        param.requires_grad = False
+
+def unfreeze_model(model):
+    for param in model.parameters():
+        param.requires_grad = True
+
 def train_loop(discriminator, original_images, batch_size, discriminator_features, discriminator_loss_fn,
-               accelerator, optimizer, generator, ratios, embeddings, generator_loss_fn, sampler : BucketSampler):
+               accelerator, optimizer, generator, ratios, embeddings, generator_loss_fn, single_step, sampler : BucketSampler):
+    
+    ############### discriminator ###########################################
     discriminator_total_loss = 0
     generator_total_loss = 0
 
     # push the real image into the discriminator
-    disciminator_pred = discriminator(original_images)
+    freeze_model(generator)
+    unfreeze_model(discriminator)
+    disciminator_pred = discriminator(original_images, embeddings)
     real_preds = torch.ones((batch_size, discriminator_features)).to(device=disciminator_pred.device, dtype=disciminator_pred.dtype)
     loss = discriminator_loss_fn(disciminator_pred, real_preds)
     discriminator_total_loss = discriminator_total_loss + loss
@@ -138,7 +150,7 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
 
     # push a fake image into the discriminator
     fake_images = torch.rand_like(original_images)
-    disciminator_pred = discriminator(fake_images)
+    disciminator_pred = discriminator(fake_images, embeddings)
     fake_preds = torch.zeros((batch_size, discriminator_features)).to(device=disciminator_pred.device, dtype=disciminator_pred.dtype)
     loss = discriminator_loss_fn(disciminator_pred, fake_preds)
     discriminator_total_loss = discriminator_total_loss + loss
@@ -146,43 +158,43 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
     optimizer.step()
     optimizer.zero_grad()
 
-    # freeze the discriminator
-    #for param in discriminator.parameters():
-        #param.requires_grad = False
+    ############### generator ###########################################
+    freeze_model(discriminator)
+    unfreeze_model(generator)
     
-    # only do for one column
     with torch.no_grad():
-        start_column = torch.randint(0, generator.num_columns - 2, (1,))[0]
         z_fake_images = torch.fft.fftn(fake_images.to(torch.float), dim=(2, 3))
-        #z_images = generator(z_fake_images, ratios, embeddings, stop_column=start_column)
-    #z_images = generator(z_images, ratios, embeddings, start_column=start_column, stop_column=start_column+1)
-    z_images = generator(z_fake_images, ratios, embeddings)
+
+    if single_step:
+        # only do for one column
+        with torch.no_grad():
+            start_column = torch.randint(0, generator.num_columns - 2, (1,))[0]
+            z_images = generator(z_fake_images, ratios, embeddings, stop_column=start_column)
+        z_images = generator(z_images, ratios, embeddings, start_column=start_column, stop_column=start_column+1)
+        coeff = (start_column+1) / (generator.num_columns - 1)
+        wanted_score = 2 * coeff / (1 + torch.pow(coeff, 2))
+        preds = torch.full((batch_size, discriminator_features), wanted_score).to(device=disciminator_pred.device, dtype=disciminator_pred.dtype)
+    else:
+        z_images = generator(z_fake_images, ratios, embeddings)
+        preds = real_preds
 
     # make sure we don't have complex images
     generated_images = torch.fft.ifftn(z_images, (generator.image_size, generator.image_size), dim=(2, 3))
     generated_images = generated_images.real
-    disciminator_pred = discriminator(generated_images)
-
-    # the score of the discriminator should follow a quadratic formula based on the column progress
-    coeff = (start_column+1) / (generator.num_columns - 1)
-    wanted_score = 2 * coeff / (1 + torch.pow(coeff, 2))
-    preds = torch.full((batch_size, discriminator_features), wanted_score).to(device=disciminator_pred.device, dtype=disciminator_pred.dtype)
+    generated_images = torch.nn.functional.relu(generated_images)
+    disciminator_pred = discriminator(generated_images, embeddings)
     loss_d = discriminator_loss_fn(disciminator_pred, preds)
     loss_d = loss_d.to(dtype=generated_images.dtype)
     discriminator_total_loss = discriminator_total_loss + loss_d
 
     # rip the vram requirements for this
-    loss_g = generator_loss_fn(generated_images, original_images)
-    loss_g = loss_g + loss_d
-    loss_g = loss_g.to(dtype=generated_images.dtype)
+    #loss_g = generator_loss_fn(generated_images, original_images)
+    #loss_g = loss_g.to(dtype=generated_images.dtype)
+    loss_g = loss_d
     generator_total_loss = generator_total_loss + loss_g
     accelerator.backward(loss_g)
     #accelerator.backward(loss_d)
     optimizer.step()
-
-    # unfreeze the discriminator
-    #for param in discriminator.parameters():
-        #param.requires_grad = True
     optimizer.zero_grad()
 
     # update the progress bar
@@ -265,6 +277,7 @@ def train(args):
     epochs = args.epochs
     steps_per_eval = args.steps_per_eval
     eval_prompts = args.eval_prompts
+    single_step = args.single_step
 
     dataset = ImageDataset(dataset_folder)
     generator_embed_dim = args.generator_embed_dim
@@ -279,7 +292,7 @@ def train(args):
     eval_image_height = args.eval_image_height
     eval_image_width = args.eval_image_width
     extract_t5 = args.extract_t5
-    discriminator = Discriminator(image_size, discriminator_features)
+    discriminator = Discriminator(image_size, discriminator_features, generator_embed_dim // 3, generator_num_heads)
     generator = Generator(image_size, generator_num_rows, generator_num_heads, generator_embed_dim, generator_ratio_mult)
 
     # setup the optimizers
@@ -337,7 +350,7 @@ def train(args):
             embeddings[:, :captions.shape[1]] = captions
 
             train_loop(discriminator, original_images, batch_size, discriminator_features, discriminator_loss_fn, accelerator,
-                       optimizer, generator, ratios, embeddings, generator_loss_fn, bucket_sampler)
+                       optimizer, generator, ratios, embeddings, generator_loss_fn, single_step, bucket_sampler)
             
             # check if we need to do evaluations images
             step_count = step_count + 1
@@ -360,6 +373,7 @@ if __name__ == '__main__':
     parser.add_argument('--eval_image_width', type=int, required=False, default=512)
     parser.add_argument('--steps_per_eval', type=int, required=False, default=5)
     parser.add_argument('--extract_t5', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--single_step', action=argparse.BooleanOptionalAction)
     parser.add_argument('--eval_prompts', '-l', nargs='+', required=True)
 
     args = parser.parse_args()

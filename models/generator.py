@@ -22,44 +22,63 @@ class Transformer(nn.Module):
         # self attention
         self.self_attn = nn.MultiheadAttention(embed_dim=3 * column_width * image_height, num_heads=num_heads, batch_first=True)
 
-        # linear layer at the end
-        self.linear = nn.Sequential(
+        # linear layer on input signal
+        self.linear0 = nn.Sequential(
             nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
             nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
+        )
+
+        # linear layer on output signal
+        self.linear1 = nn.Sequential(
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
             nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
         )
-        def init_weights(m):
-            if isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
 
-        self.linear.apply(init_weights)
+        # linear layer just after the cross attention
+        self.attention_linear0 = nn.Sequential(
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
+        )
 
-        # relu activation layer
-        self.relu = nn.ReLU()
-
-        # tanh activation layer
-        self.tanh = nn.Tanh()
+        # linear layer just after the self attention
+        self.attention_linear1 = nn.Sequential(
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
+            nn.Linear(3 * column_width * image_height, 3 * column_width * image_height),
+            nn.ReLU(),
+        )
 
     def forward(self, x, embeddings):
+        # linear layer on input signal
+        y = torch.flatten(x, start_dim=1)
+        y = self.linear0(y)
+        x = torch.reshape(y, x.shape)
+
         # do some calculations with the embeddings
         query = torch.flatten(x, start_dim=1)
         key = embeddings.to(device=query.device, dtype=query.dtype)
         attn_output, attn_output_weights = self.cross_attn(query, key, query)
+        attn_output = self.attention_linear0(attn_output)
 
         # add input_freq and attention output
         x = x + attn_output.reshape(x.shape)
-        x = self.layer_norm(x)
-        #x = self.relu(x)
 
-        # feedforward
+        # self attention
         query = torch.flatten(x, start_dim=1)
         attn_output, attn_output_weights = self.self_attn(query, query, query)
+        attn_output = self.attention_linear1(attn_output)
         x = x + attn_output.reshape(x.shape)
-        x = self.layer_norm(x)
 
-        y = torch.flatten(x, start_dim=1)
-        y = self.linear(y)
-        return torch.reshape(y, x.shape)
+        # linear layer on output signal
+        y = torch.flatten(y, start_dim=1)
+        y = self.linear1(y)
+        x = torch.reshape(y, x.shape)
+        return x
 
 class TileGenerator(nn.Module):
     def __init__(self, image_size, num_columns, num_heads, embed_dim, ratio_multiplier):
