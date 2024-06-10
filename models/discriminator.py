@@ -31,6 +31,7 @@ class Discriminator(nn.Module):
         x = self.conv_layers(image)
         x = self.layer_norm(x)
         x = self.forward_layer(torch.flatten(x, 1))
+        x = x.to(device=device, dtype=dtype)
         return x
 
 if __name__ == '__main__':

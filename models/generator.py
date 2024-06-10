@@ -114,19 +114,19 @@ class Generator(nn.Module):
         self.ratio_multiplier = ratio_multiplier
         self.image_size = image_size
 
-    def forward(self, images, ratios, prompt_embeds, start_column = 0, stop_column=-1):
-        device = images.device
-        dtype = images.dtype
+    def forward(self, z_images, ratios, prompt_embeds, start_column = 0, stop_column=-1):
+        device = z_images.device
+        dtype = z_images.dtype
 
         prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
         batch_size = ratios.shape[0]
 
         # first resize the images to square images
         transform = Resize((self.image_size, self.image_size))
-        images = transform(images)
+        z_images = transform(z_images)
 
         # calculate the discrete real fft transform
-        z_images = torch.fft.fftn(images, s=(self.image_size, self.image_size))
+        #z_images = torch.fft.fftn(images.to(dtype=torch.float32), s=(self.image_size, self.image_size))
 
         # calculate the ratio
         ratios_mult = ratios * self.ratio_multiplier
@@ -138,8 +138,8 @@ class Generator(nn.Module):
         for column in range(start_column, stop_column):
             z_images = self.tile_generator(z_images, ratios_mult, prompt_embeds, column)
 
-        images = torch.fft.ifftn(z_images, (self.image_size, self.image_size), dim=(2, 3))
-        return images
+        #images = torch.fft.ifftn(z_images, (self.image_size, self.image_size), dim=(2, 3))
+        return z_images
     
 if __name__ == '__main__':
     batch_size = 1
