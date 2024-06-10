@@ -55,6 +55,7 @@ class BucketSampler(Sampler):
         self.progress_bar = tqdm(self.batches)
 
     def __iter__(self):
+        self.progress_bar = tqdm(self.batches)
         for batch in self.progress_bar:
             captions = []
             images = []
@@ -63,6 +64,9 @@ class BucketSampler(Sampler):
                 with Image.open(image_path) as image:
                     caption = torch.load(caption_path, weights_only=True)
                     image = pil_to_tensor(image)
+
+                    # put it between -1 and 1
+                    image = image/256
                     captions.append(caption[0])
                     images.append(image)
 
@@ -155,7 +159,7 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
 
     # make sure we don't have complex images
     generated_images = torch.fft.ifftn(z_images, (generator.image_size, generator.image_size), dim=(2, 3))
-    generated_images = generated_images.abs()
+    generated_images = generated_images.real
     generated_images = generated_images.to(dtype=torch.bfloat16)
     disciminator_pred = discriminator(generated_images)
 
@@ -169,10 +173,11 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
 
     # rip the vram requirements for this
     loss_g = generator_loss_fn(generated_images, original_images)
+    loss_g = loss_g + loss_d
     loss_g = loss_g.to(dtype=generated_images.dtype)
     generator_total_loss = generator_total_loss + loss_g
-    accelerator.backward(loss_g, retain_graph=True)
-    accelerator.backward(loss_d)
+    accelerator.backward(loss_g)
+    #accelerator.backward(loss_d)
     optimizer.step()
 
     # unfreeze the discriminator
@@ -181,7 +186,7 @@ def train_loop(discriminator, original_images, batch_size, discriminator_feature
     optimizer.zero_grad()
 
     # update the progress bar
-    sampler.progress_bar.set_description(f'discriminator_loss={discriminator_total_loss}, generator_loss={generator_total_loss}')
+    sampler.progress_bar.set_description(f'discriminator_loss={discriminator_total_loss}, generator_loss={generator_total_loss}', refresh=True)
 
 def extract_features(tokenizer : T5Tokenizer, encoder : T5ForConditionalGeneration, dataset_folder, generator_embed_dim, device='cuda'):
     # we load all .txt images and put them on the disk
@@ -225,7 +230,7 @@ def eval(generator, prompts, generator_embed_dim, width, height, device='cuda'):
         embeddings = embeddings.to(device=device)
         z_images = generator(z_images, ratios, embeddings)
         images = torch.fft.ifftn(z_images, (generator.image_size, generator.image_size), dim=(2, 3))
-        images = images.abs()
+        images = images.real
 
         # we need to resize the image for the ratio
         model_size = images.shape[2]
@@ -238,6 +243,7 @@ def eval(generator, prompts, generator_embed_dim, width, height, device='cuda'):
         
         transform = Resize((new_height, new_width))
         images = transform(images)
+        images = images * 255
         images = images.to(dtype=torch.uint8)
 
         i = 0
@@ -276,7 +282,7 @@ def train(args):
     generator = Generator(image_size, generator_num_rows, generator_num_heads, generator_embed_dim, generator_ratio_mult)
 
     # setup the optimizers
-    optimizer = AdamW(params=generator.parameters(), lr=lr)
+    optimizer = AdamW(params=list(generator.parameters()) + list(discriminator.parameters()), lr=lr)
     tokenizer = T5Tokenizer.from_pretrained("google-t5/t5-small")
     encoder = T5ForConditionalGeneration.from_pretrained("google-t5/t5-small")
     accelerator = Accelerator(mixed_precision='bf16')
@@ -344,14 +350,14 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, required=True)
     parser.add_argument('--lr', type=float, required=True)
     parser.add_argument('--image_size', type=int, required=False, default=512)
-    parser.add_argument('--discriminator_features', type=int, required=False, default=48)
+    parser.add_argument('--discriminator_features', type=int, required=False, default=16)
     parser.add_argument('--generator_num_rows', type=int, required=False, default=128)
     parser.add_argument('--generator_num_heads', type=int, required=False, default=8)
     parser.add_argument('--generator_embed_dim', type=int, required=False, default=900)
     parser.add_argument('--generator_ratio_mult', type=int, required=False, default=100)
     parser.add_argument('--eval_image_height', type=int, required=False, default=512)
     parser.add_argument('--eval_image_width', type=int, required=False, default=512)
-    parser.add_argument('--steps_per_eval', type=int, required=False, default=50000)
+    parser.add_argument('--steps_per_eval', type=int, required=False, default=5)
     parser.add_argument('--extract_t5', action=argparse.BooleanOptionalAction)
     parser.add_argument('--eval_prompts', '-l', nargs='+', required=True)
 
